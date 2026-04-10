@@ -1,15 +1,15 @@
 {
   "files": {
     "main.css": "/Ch-aviation/static/css/main.e6c13ad2.css",
-    "main.js": "/Ch-aviation/static/js/main.d2a9b347.js",
+    "main.js": "/Ch-aviation/static/js/main.5a4669f6.js",
     "static/js/453.b0ea4140.chunk.js": "/Ch-aviation/static/js/453.b0ea4140.chunk.js",
     "index.html": "/Ch-aviation/index.html",
     "main.e6c13ad2.css.map": "/Ch-aviation/static/css/main.e6c13ad2.css.map",
-    "main.d2a9b347.js.map": "/Ch-aviation/static/js/main.d2a9b347.js.map",
+    "main.5a4669f6.js.map": "/Ch-aviation/static/js/main.5a4669f6.js.map",
     "453.b0ea4140.chunk.js.map": "/Ch-aviation/static/js/453.b0ea4140.chunk.js.map"
   },
   "entrypoints": [
     "static/css/main.e6c13ad2.css",
-    "static/js/main.d2a9b347.js"
+    "static/js/main.5a4669f6.js"
   ]
 }
