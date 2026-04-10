@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import {
   BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, AreaChart, Area
@@ -6,6 +6,8 @@ import {
 
 // SheetJS loaded dynamically at runtime (ESM CDN, not available as npm package in CRA)
 const XLSX_SCRIPT = "https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs";
+/** Served from `public/Gem Status.xlsx` (copy of project Gem Status.xlsx); browsers cannot read arbitrary disk paths. */
+const GEM_STATUS_PUBLIC_FILE = "Gem Status.xlsx";
 
 /* ─── DESIGN TOKENS ─── */
 const T = {
@@ -134,7 +136,6 @@ function processExcel(wb) {
 const opHeader = (v) => String(v || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ");
 const opNum = (v) => { const n = Number(String(v ?? "").replace(/,/g, "").trim()); return Number.isFinite(n) ? n : 0; };
 const opText = (v, f = "Unknown") => String(v ?? "").trim() || f;
-const opMonthSort = (v) => OP_MONTHS[String(v || "").toLowerCase()] || OP_MONTHS[String(v || "").toLowerCase().slice(0, 3)] || Number.MAX_SAFE_INTEGER;
 const opFmt = (v) => Math.round(v || 0).toLocaleString();
 function opPick(obj, keys) { for (const k of keys) if (obj[k] !== undefined && obj[k] !== null && obj[k] !== "") return obj[k]; return ""; }
 function opTypeFrom(model) { return String(model || "").toUpperCase().includes("LEAP") ? "LEAP" : "CFM"; }
@@ -142,6 +143,88 @@ function opFamilyFrom(model) { const m = String(model || "").toUpperCase(); if (
 function opDashFrom(model) { const m = String(model || "").toUpperCase().match(/-(\d[A-Z]?)/); return m ? m[1] : "Unknown"; }
 function opStatusFrom(v) { const s = String(v || "").trim(); const l = s.toLowerCase(); if (!s) return "Unknown"; if (l.includes("active")) return "Active"; if (l.includes("store")) return "Stored"; if (l.includes("maint")) return "Maintenance"; if (l.includes("repair")) return "Repair"; if (l.includes("retired")) return "Retired"; if (l.includes("not yet delivered")) return "Not yet delivered"; return s; }
 function opMonthFrom(raw, file) { const d = String(raw || "").trim().toLowerCase(); if (OP_MONTHS[d]) return d.slice(0,3).toUpperCase(); const f = String(file || "").toLowerCase(); const k = Object.keys(OP_MONTHS).find((x) => f.includes(x)); return k ? k.slice(0,3).toUpperCase() : "Unknown"; }
+
+/** Normalized key for joining master data rows to GEM Status Excel (Engine Serial / ESN / MSN). */
+const OP_JOIN_KEY_SOURCES = ["engine serial number", "engine serial", "esn", "serial number", "serial no", "serial", "msn", "aircraft msn"];
+const GEM_STATUS_KEYS = ["gem status", "gemstatus", "gem status code", "gem state", "gem classification"];
+const GEM_COMMENT_KEYS = ["comments", "comment", "remarks", "notes", "gem comments"];
+
+const GEM_ALLOWED_VALUES = new Set(["0", "1", "2", "3"]);
+function normalizeGemStatus(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v).trim();
+  if (!s) return "";
+  // Some excels may store numeric statuses as 0/1/2/3 numbers.
+  const asNum = Number(s);
+  if (Number.isFinite(asNum) && GEM_ALLOWED_VALUES.has(String(asNum))) return String(asNum);
+  if (GEM_ALLOWED_VALUES.has(s)) return s;
+  return "";
+}
+
+/** Resolves GEM Status cell from known headers or any column whose name suggests GEM status. */
+function opPickGemStatus(x) {
+  const direct = opPick(x, GEM_STATUS_KEYS);
+  const directNorm = normalizeGemStatus(direct);
+  if (directNorm !== "") return directNorm;
+  for (const [k, v] of Object.entries(x)) {
+    if (v === undefined || v === null || String(v).trim() === "") continue;
+    const kn = String(k).toLowerCase().replace(/[^a-z0-9]+/g, " ");
+    if (kn.includes("gem") && kn.includes("status")) return normalizeGemStatus(v);
+  }
+  return "";
+}
+
+function opJoinKey(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  return s.toLowerCase().replace(/[\s\-_]/g, "");
+}
+
+function opOperatorKey(raw) {
+  return String(raw ?? "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function parseGemWorkbook(wb) {
+  const sheet = wb.Sheets[wb.SheetNames[0]];
+  const rows = window.__XLSX__.utils.sheet_to_json(sheet, { defval: "" });
+  const lookup = {};
+  const operatorLookup = {};
+  const statusFromExcel = new Set();
+  rows.forEach((source) => {
+    const x = {};
+    Object.entries(source).forEach(([k, v]) => { x[opHeader(k)] = v; });
+    const gemRaw = opPickGemStatus(x);
+    // track only blank + 0/1/2/3
+    if (gemRaw === "" || GEM_ALLOWED_VALUES.has(gemRaw)) statusFromExcel.add(gemRaw);
+    const operator = opText(opPick(x, ["operator name", "operator", "airline"]), "");
+    const operatorKey = opOperatorKey(operator);
+    const rawKey = opPick(x, OP_JOIN_KEY_SOURCES);
+    const jk = opJoinKey(rawKey);
+    const gemStatus = gemRaw; // blank or 0/1/2/3 only
+    const comments = String(opPick(x, GEM_COMMENT_KEYS) ?? "").trim();
+    const gemValue = { gemStatus, comments };
+    if (jk) lookup[jk] = gemValue;
+    if (operatorKey) {
+      if (!operatorLookup[operatorKey]) operatorLookup[operatorKey] = { statuses: new Set(), comments: new Set() };
+      operatorLookup[operatorKey].statuses.add(gemStatus);
+      if (comments) operatorLookup[operatorKey].comments.add(comments);
+    }
+  });
+  return {
+    lookup,
+    operatorLookup: Object.fromEntries(
+      Object.entries(operatorLookup).map(([key, value]) => [
+        key,
+        {
+          gemStatus: Array.from(value.statuses).sort((a, b) => a.localeCompare(b)).join(", "),
+          comments: Array.from(value.comments).join(" | "),
+        }
+      ])
+    ),
+    gemStatusList: Array.from(statusFromExcel).sort((a, b) => a.localeCompare(b)),
+  };
+}
+
 function opParseWorkbook(file, wb) {
   const sheet = wb.Sheets[wb.SheetNames[0]];
   const rows = window.__XLSX__.utils.sheet_to_json(sheet, { defval: "" });
@@ -149,6 +232,9 @@ function opParseWorkbook(file, wb) {
     const x = {};
     Object.entries(source).forEach(([k, v]) => { x[opHeader(k)] = v; });
     const model = opPick(x, ["engine full name", "engine model", "engine", "model"]);
+    const joinKey = opJoinKey(opPick(x, OP_JOIN_KEY_SOURCES));
+    const gemRaw = opPickGemStatus(x);
+    const comPick = opPick(x, GEM_COMMENT_KEYS);
     return {
       id: `${file.name}-${i}`,
       month: opMonthFrom(opPick(x, ["month", "period"]), file.name),
@@ -160,7 +246,11 @@ function opParseWorkbook(file, wb) {
       family: opFamilyFrom(model),
       dash: opDashFrom(model),
       status: opStatusFrom(opPick(x, ["status", "engine status"])),
-      engines: opNum(opPick(x, ["number of engines", "engines", "engine count", "count"])) || 1
+      engines: opNum(opPick(x, ["number of engines", "engines", "engine count", "count"])) || 1,
+      joinKey,
+      operatorKey: opOperatorKey(opPick(x, ["operator name", "operator", "airline"])),
+      gemStatus: gemRaw, // blank or 0/1/2/3 only
+      comments: String(comPick ?? "").trim()
     };
   });
 }
@@ -566,6 +656,7 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
   const [tab, setTab] = useState("overview");
   const [mode, setMode] = useState("classic");
   const [xlsxReady, setXlsxReady] = useState(!!window.__XLSX__);
+  const [operatorRows, setOperatorRows] = useState([]);
 
   useEffect(() => {
     if (window.__XLSX__) { setXlsxReady(true); return; }
@@ -576,6 +667,62 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
     window.addEventListener("xlsxready", () => setXlsxReady(true), { once:true });
   }, []);
 
+  const [gemFileName, setGemFileName] = useState("");
+  const [gemLookup, setGemLookup] = useState(null);
+  const [gemOperatorLookup, setGemOperatorLookup] = useState(null);
+  const [gemStatusList, setGemStatusList] = useState([]);
+  const [gemLoading, setGemLoading] = useState(false);
+  const [gemError, setGemError] = useState("");
+
+  useEffect(() => {
+    if (!data) setOperatorRows([]);
+  }, [data]);
+
+  useEffect(() => {
+    if (!xlsxReady || !window.__XLSX__) return;
+    let cancelled = false;
+    setGemLoading(true);
+    setGemError("");
+    (async () => {
+      try {
+        const base = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
+        const url = `${base}/${encodeURIComponent(GEM_STATUS_PUBLIC_FILE)}`;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        if (cancelled) return;
+        const wb = window.__XLSX__.read(buf, { type: "array" });
+        const parsed = parseGemWorkbook(wb);
+        setGemLookup(parsed.lookup);
+        setGemOperatorLookup(parsed.operatorLookup);
+        setGemStatusList(parsed.gemStatusList);
+        setGemFileName(GEM_STATUS_PUBLIC_FILE);
+      } catch {
+        if (!cancelled) {
+          setGemLookup(null);
+          setGemOperatorLookup(null);
+          setGemStatusList([]);
+          setGemFileName("");
+          setGemError("Could not load Gem Status.xlsx. Place the file at public/Gem Status.xlsx (same workbook as your project Gem Status.xlsx).");
+        }
+      } finally {
+        if (!cancelled) setGemLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [xlsxReady]);
+
+  const mergedOperatorRows = useMemo(() => {
+    if ((!gemLookup || !Object.keys(gemLookup).length) && (!gemOperatorLookup || !Object.keys(gemOperatorLookup).length)) return operatorRows;
+    return operatorRows.map((r) => {
+      const bySerial = r.joinKey && gemLookup?.[r.joinKey];
+      const byOperator = r.operatorKey && gemOperatorLookup?.[r.operatorKey];
+      const mergedGemStatus = bySerial?.gemStatus || byOperator?.gemStatus || r.gemStatus || "";
+      const mergedComments = bySerial?.comments || byOperator?.comments || r.comments || "";
+      return { ...r, gemStatus: mergedGemStatus, comments: mergedComments };
+    });
+  }, [operatorRows, gemLookup, gemOperatorLookup]);
+
   const handleFile = useCallback(async (file) => {
     if (!file || !xlsxReady) return;
     setLoading(true); setError("");
@@ -584,6 +731,7 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
       const buf = await file.arrayBuffer();
       const wb = window.__XLSX__.read(buf, { type:"array" });
       setData(processExcel(wb));
+      setOperatorRows(opParseWorkbook(file, wb));
     } catch { setError("Failed to parse file. Please upload a valid CH Aviation Excel file."); }
     setLoading(false);
   }, [xlsxReady]);
@@ -639,7 +787,7 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
             <div style={{ display:"flex", gap:8, marginBottom:14 }}>
               {[
                 { id:"classic", label:"Classic Dashboard" },
-                { id:"operator-leap", label:"Operator Search + Leap Engine" }
+                { id:"operator-leap", label:"Operator Search" }
               ].map((m) => (
                 <button key={m.id} onClick={() => setMode(m.id)} style={{
                   background: mode === m.id ? `${T.cyan}22` : "none",
@@ -667,7 +815,7 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
                     </button>
                   ))}
                   <div style={{ flex:1 }} />
-                  <button onClick={() => { setData(null); setFileName(""); }} style={{
+                  <button onClick={() => { setData(null); setFileName(""); setOperatorRows([]); }} style={{
                     background:"none", border:`1px solid ${T.dim}`, borderRadius:6, cursor:"pointer",
                     fontFamily:T.font, fontSize:10, color:T.muted, padding:"6px 14px", marginBottom:4
                   }}>↩ New Upload</button>
@@ -675,7 +823,14 @@ function DashboardSection({ data, setData, fileName, setFileName }) {
                 <DashboardContent data={data} tab={tab} />
               </>
             ) : (
-              <OperatorLeapPanel xlsxReady={xlsxReady} />
+              <OperatorLeapPanel
+                rows={mergedOperatorRows}
+                sourceFileName={fileName}
+                gemFileName={gemFileName}
+                gemLoading={gemLoading}
+                gemError={gemError}
+                gemStatusListFromExcel={gemStatusList}
+              />
             )}
           </div>
         )}
@@ -1170,40 +1325,85 @@ function OpSectionTitle({ title, subtitle }) {
   );
 }
 
-function OperatorLeapPanel({ xlsxReady }) {
-  const folderRef = useRef(null);
-  const [rows, setRows] = useState([]);
-  const [trendRows, setTrendRows] = useState([]);
-  const [activeTab, setActiveTab] = useState("operator-search");
-  const [singleFileName, setSingleFileName] = useState("");
-  const [folderInfo, setFolderInfo] = useState({ count: 0, months: [] });
-  const [loadingSingle, setLoadingSingle] = useState(false);
-  const [loadingFolder, setLoadingFolder] = useState(false);
-  const [error, setError] = useState("");
+function OperatorLeapPanel({ rows, sourceFileName, gemFileName, gemLoading, gemError, gemStatusListFromExcel }) {
   const [openFilterKey, setOpenFilterKey] = useState(null);
-  const [filters, setFilters] = useState({ family: [], continent: [], status: [], dash: [], country: [], operator: [] });
-  const [filterSearch, setFilterSearch] = useState({ family: "", continent: "", status: "", dash: "", country: "", operator: "" });
+  const [filters, setFilters] = useState({ family: [], continent: [], status: [], dash: [], gemStatus: [], country: [], operator: [] });
+  const [filterSearch, setFilterSearch] = useState({ family: "", continent: "", status: "", dash: "", gemStatus: "", country: "", operator: "" });
+  const [commentContains, setCommentContains] = useState("");
+  const [resultPage, setResultPage] = useState(1);
+  const RESULT_PAGE_SIZE = 50;
+
+  useEffect(() => {
+    setFilters({ family: [], continent: [], status: [], dash: [], gemStatus: [], country: [], operator: [] });
+    setFilterSearch({ family: "", continent: "", status: "", dash: "", gemStatus: "", country: "", operator: "" });
+    setCommentContains("");
+    setOpenFilterKey(null);
+    setResultPage(1);
+  }, [rows]);
 
   const includesFilter = (values, value) => !values.length || values.includes(value);
-  const baseRows = rows.filter((r) => includesFilter(filters.family, r.family) && includesFilter(filters.continent, r.continent) && includesFilter(filters.status, r.status) && includesFilter(filters.dash, r.dash));
+  const commentMatch = (r) => {
+    const q = commentContains.trim().toLowerCase();
+    if (!q) return true;
+    return String(r.comments ?? "").toLowerCase().includes(q);
+  };
+  const baseRows = rows.filter((r) =>
+    includesFilter(filters.family, r.family) &&
+    includesFilter(filters.continent, r.continent) &&
+    includesFilter(filters.status, r.status) &&
+    includesFilter(filters.dash, r.dash) &&
+    includesFilter(filters.gemStatus, r.gemStatus)
+  );
   const countryOptions = Array.from(new Set(baseRows.map((r) => r.country))).sort();
   const operatorOptions = Array.from(new Set(baseRows.filter((r) => includesFilter(filters.country, r.country)).map((r) => r.operator))).sort();
-  const filtered = baseRows.filter((r) => includesFilter(filters.country, r.country) && includesFilter(filters.operator, r.operator));
-  const options = (() => { const get = (k) => Array.from(new Set(rows.map((r) => r[k]))).sort(); return { family: get("family"), continent: get("continent"), status: get("status"), dash: get("dash") }; })();
+  const filtered = baseRows.filter((r) =>
+    includesFilter(filters.country, r.country) &&
+    includesFilter(filters.operator, r.operator) &&
+    commentMatch(r)
+  );
+  const options = (() => {
+    const get = (k) => Array.from(new Set(rows.map((r) => r[k]))).sort();
+    const gemFromRows = get("gemStatus");
+    const allowed = ["", "0", "1", "2", "3"];
+    const mergedSet = new Set([...(gemStatusListFromExcel || []), ...gemFromRows]);
+    const gemMerged = allowed.filter((v) => mergedSet.has(v));
+    return { family: get("family"), continent: get("continent"), status: get("status"), dash: get("dash"), gemStatus: gemMerged };
+  })();
 
   const grouped = (() => {
     const map = new Map();
     filtered.forEach((r) => {
       const key = `${r.operator}||${r.country}||${r.continent}`;
-      if (!map.has(key)) map.set(key, { key, operator: r.operator, country: r.country, continent: r.continent, family: {}, dash: {}, status: {}, engines: 0 });
+      if (!map.has(key)) {
+        map.set(key, {
+          key, operator: r.operator, country: r.country, continent: r.continent,
+          family: {}, dash: {}, status: {}, gem: {}, engines: 0, commentHints: new Set()
+        });
+      }
       const g = map.get(key);
       g.family[r.family] = (g.family[r.family] || 0) + r.engines;
       g.dash[r.dash] = (g.dash[r.dash] || 0) + r.engines;
       g.status[r.status] = (g.status[r.status] || 0) + r.engines;
+      g.gem[r.gemStatus] = (g.gem[r.gemStatus] || 0) + r.engines;
+      if (String(r.comments ?? "").trim()) {
+        const t = String(r.comments).trim();
+        g.commentHints.add(t.length > 56 ? `${t.slice(0, 56)}…` : t);
+      }
       g.engines += r.engines;
     });
     return Array.from(map.values()).sort((a, b) => b.engines - a.engines);
   })();
+
+  useEffect(() => {
+    setResultPage(1);
+  }, [
+    filters.family, filters.continent, filters.status, filters.dash, filters.gemStatus, filters.country, filters.operator,
+    commentContains
+  ]);
+
+  const totalResultPages = Math.max(1, Math.ceil(grouped.length / RESULT_PAGE_SIZE));
+  const safeResultPage = Math.min(Math.max(1, resultPage), totalResultPages);
+  const pagedGrouped = grouped.slice((safeResultPage - 1) * RESULT_PAGE_SIZE, (safeResultPage - 1) * RESULT_PAGE_SIZE + RESULT_PAGE_SIZE);
 
   const kpi = {
     total: filtered.reduce((s, r) => s + r.engines, 0),
@@ -1242,107 +1442,16 @@ function OperatorLeapPanel({ xlsxReady }) {
     }
     return m;
   }, {})).map(([operator, value]) => ({ operator, value })).sort((a, b) => b.value - a.value).slice(0, 12);
-  const trendByMonth = (() => { const m = {}; trendRows.forEach((r) => { if (!m[r.month]) m[r.month] = { month: r.month, LEAP: 0, CFM: 0 }; m[r.month][r.engineType] += r.engines; }); return Object.values(m).sort((a, b) => opMonthSort(a.month) - opMonthSort(b.month)); })();
-  const leapGrowth = (() => { if (trendByMonth.length < 2) return 0; const p = trendByMonth[trendByMonth.length - 2].LEAP; const c = trendByMonth[trendByMonth.length - 1].LEAP; return p ? ((c - p) / p) * 100 : c ? 100 : 0; })();
-  const leapRegion = (() => {
-    const months = Array.from(new Set(trendRows.map((r) => r.month))).sort((a, b) => opMonthSort(a) - opMonthSort(b));
-    const continents = Array.from(new Set(trendRows.map((r) => r.continent)));
-    return months.map((m) => {
-      const row = { month: m };
-      continents.forEach((c) => {
-        row[c] = trendRows.filter((r) => r.month === m && r.continent === c && r.engineType === "LEAP").reduce((s, r) => s + r.engines, 0);
-      });
-      return row;
-    });
-  })();
-
-  async function parseFiles(fileList) {
-    if (!xlsxReady || !window.__XLSX__) throw new Error("Excel parser is still loading.");
-    const files = Array.from(fileList || []).filter((f) => /\.(xlsx|xls)$/i.test(f.name));
-    if (!files.length) throw new Error("No Excel files found.");
-    const out = [];
-    for (const file of files) {
-      const data = await file.arrayBuffer();
-      out.push(...opParseWorkbook(file, window.__XLSX__.read(data, { type: "array" })));
-    }
-    return { files, rows: out };
-  }
-
-  async function onSingle(e) {
-    setError("");
-    setLoadingSingle(true);
-    try {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      const result = await parseFiles([file]);
-      setRows(result.rows);
-      setSingleFileName(file.name);
-      setFilters({ family: [], continent: [], status: [], dash: [], country: [], operator: [] });
-      setFilterSearch({ family: "", continent: "", status: "", dash: "", country: "", operator: "" });
-    } catch (err) {
-      setError(err.message || "Failed to parse file.");
-    } finally {
-      setLoadingSingle(false);
-    }
-  }
-
-  async function onFolder(e) {
-    setError("");
-    setLoadingFolder(true);
-    try {
-      const result = await parseFiles(e.target.files);
-      const months = Array.from(new Set(result.rows.map((r) => r.month))).sort((a, b) => opMonthSort(a) - opMonthSort(b));
-      setTrendRows(result.rows);
-      setFolderInfo({ count: result.files.length, months });
-      setActiveTab("leap-engine");
-    } catch (err) {
-      setError(err.message || "Failed to parse folder files.");
-    } finally {
-      setLoadingFolder(false);
-    }
-  }
+  const byGem = Object.entries(filtered.reduce((m, r) => {
+    const g = r.gemStatus || "—";
+    m[g] = (m[g] || 0) + r.engines;
+    return m;
+  }, {})).map(([name, value]) => ({ name, value }));
 
   return (
-    <div>
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
-        {[["operator-search", "Operator Search"], ["leap-engine", "Leap Engine"]].map(([id, label]) => (
-          <button key={id} onClick={() => setActiveTab(id)} style={{ border: "1px solid rgba(148,163,184,0.25)", background: activeTab === id ? "rgba(56,189,248,0.2)" : "rgba(15,23,42,0.55)", color: "#e2e8f0", borderRadius: 999, padding: "8px 14px", cursor: "pointer" }}>{label}</button>
-        ))}
-      </div>
+    <div>     
 
-      <div style={{ display: "grid", gap: 14, gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", marginBottom: 16 }}>
-        <Card>
-          <h3>Upload Data (Operator Search)</h3>
-          <input type="file" accept=".xlsx,.xls" onChange={onSingle} />
-          <div style={{ marginTop: 8, color: "#94a3b8" }}>
-            {loadingSingle ? "Parsing..." : singleFileName ? `Loaded: ${singleFileName}` : "No file loaded"}
-          </div>
-        </Card>
-        <Card>
-          <h3>LEAP Demand Analysis (Folder)</h3>
-          <input
-            ref={folderRef}
-            type="file"
-            multiple
-            onClick={() => {
-              if (folderRef.current) {
-                folderRef.current.setAttribute("webkitdirectory", "");
-                folderRef.current.setAttribute("directory", "");
-              }
-            }}
-            onChange={onFolder}
-            accept=".xlsx,.xls"
-          />
-          <div style={{ marginTop: 8, color: "#94a3b8" }}>
-            {loadingFolder ? "Reading files..." : folderInfo.count ? `${folderInfo.count} files | Months: ${folderInfo.months.join(", ")}` : "No folder analyzed"}
-          </div>
-        </Card>
-      </div>
-
-      {error ? <Card style={{ borderColor: "rgba(248,113,113,0.45)", color: "#fda4af", marginBottom: 14 }}>{error}</Card> : null}
-
-      {activeTab === "operator-search" ? (
-        rows.length ? (
+      {rows.length ? (
           <div style={{ display: "grid", gap: 16 }}>
             <Card style={{ display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))" }}>
               {[
@@ -1350,6 +1459,7 @@ function OperatorLeapPanel({ xlsxReady }) {
                 ["Operator Continent", "continent", options.continent],
                 ["Status", "status", options.status],
                 ["Dash", "dash", options.dash],
+                ["GEM Status", "gemStatus", options.gemStatus],
                 ["Operator Country", "country", countryOptions],
                 ["Operator Name", "operator", operatorOptions],
               ].map(([label, key, list]) => (
@@ -1387,14 +1497,14 @@ function OperatorLeapPanel({ xlsxReady }) {
                       />
                       <div style={{ maxHeight: 120, overflowY: "auto", paddingRight: 2 }}>
                         {list.filter((opt) => String(opt).toLowerCase().includes(filterSearch[key].toLowerCase())).map((opt) => (
-                          <label key={opt} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#e2e8f0", marginBottom: 4 }}>
+                          <label key={`${key}-${opt || "-"}`} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#e2e8f0", marginBottom: 4 }}>
                             <input
                               type="checkbox"
                               checked={filters[key].includes(opt)}
                               onChange={() => setFilters((prev) => {
                                 const selected = prev[key].includes(opt) ? prev[key].filter((x) => x !== opt) : [...prev[key], opt];
                                 const next = { ...prev, [key]: selected };
-                                if (["family", "continent", "status", "dash"].includes(key)) {
+                                if (["family", "continent", "status", "dash", "gemStatus"].includes(key)) {
                                   next.country = [];
                                   next.operator = [];
                                 }
@@ -1402,7 +1512,7 @@ function OperatorLeapPanel({ xlsxReady }) {
                                 return next;
                               })}
                             />
-                            <span>{opt}</span>
+                            <span>{opt === "" ? "-" : opt}</span>
                           </label>
                         ))}
                         {!list.filter((opt) => String(opt).toLowerCase().includes(filterSearch[key].toLowerCase())).length ? (
@@ -1413,6 +1523,16 @@ function OperatorLeapPanel({ xlsxReady }) {
                   ) : null}
                 </div>
               ))}
+              <div style={{ gridColumn: "1 / -1" }}>
+                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 6 }}>Comments contain</div>
+                <input
+                  type="text"
+                  value={commentContains}
+                  onChange={(e) => setCommentContains(e.target.value)}
+                  placeholder="Filter by text in Comments (from GEM file or master columns)"
+                  style={{ width: "100%", borderRadius: 8, border: "1px solid rgba(148,163,184,0.3)", background: "rgba(15,23,42,0.7)", color: "#e2e8f0", height: 36, padding: "0 10px", fontSize: 13 }}
+                />
+              </div>
             </Card>
 
             <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit,minmax(180px,1fr))" }}>
@@ -1426,23 +1546,65 @@ function OperatorLeapPanel({ xlsxReady }) {
 
             <Card style={{ overflowX: "auto" }}>
               <OpSectionTitle title="Operator Engine Distribution" subtitle="Grouped rows with expandable status breakdown" />
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+                <div style={{ fontFamily: T.font, fontSize: 11, color: "#94a3b8" }}>
+                  Showing {(grouped.length ? ((safeResultPage - 1) * RESULT_PAGE_SIZE + 1) : 0)}–{Math.min(safeResultPage * RESULT_PAGE_SIZE, grouped.length)} of {grouped.length} groups
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <button
+                    onClick={() => setResultPage((p) => Math.max(1, p - 1))}
+                    disabled={safeResultPage === 1}
+                    style={{
+                      fontFamily: T.font,
+                      fontSize: 10,
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid rgba(148,163,184,0.25)",
+                      background: safeResultPage === 1 ? "rgba(15,23,42,0.35)" : "rgba(15,23,42,0.7)",
+                      color: safeResultPage === 1 ? "rgba(148,163,184,0.55)" : "#e2e8f0",
+                      cursor: safeResultPage === 1 ? "default" : "pointer",
+                    }}
+                  >
+                    ‹ Prev
+                  </button>
+                  <div style={{ fontFamily: T.font, fontSize: 10, color: "#94a3b8" }}>
+                    Page {safeResultPage} of {totalResultPages}
+                  </div>
+                  <button
+                    onClick={() => setResultPage((p) => Math.min(totalResultPages, p + 1))}
+                    disabled={safeResultPage === totalResultPages}
+                    style={{
+                      fontFamily: T.font,
+                      fontSize: 10,
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid rgba(148,163,184,0.25)",
+                      background: safeResultPage === totalResultPages ? "rgba(15,23,42,0.35)" : "rgba(15,23,42,0.7)",
+                      color: safeResultPage === totalResultPages ? "rgba(148,163,184,0.55)" : "#e2e8f0",
+                      cursor: safeResultPage === totalResultPages ? "default" : "pointer",
+                    }}
+                  >
+                    Next ›
+                  </button>
+                </div>
+              </div>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead>
                   <tr style={{ color: "#94a3b8", textAlign: "left" }}>
-                    <th style={{ padding: 8 }}>Country</th><th style={{ padding: 8 }}>Operator</th><th style={{ padding: 8 }}>Continent</th><th style={{ padding: 8 }}>Family</th><th style={{ padding: 8 }}>Dash</th><th style={{ padding: 8 }}>Status</th><th style={{ padding: 8 }}>Engines</th>
+                    <th style={{ padding: 8 }}>Country</th><th style={{ padding: 8 }}>Operator</th><th style={{ padding: 8 }}>Continent</th><th style={{ padding: 8 }}>Family</th><th style={{ padding: 8 }}>Dash</th><th style={{ padding: 8 }}>Status</th><th style={{ padding: 8 }}>GEM Status</th><th style={{ padding: 8 }}>Comments</th><th style={{ padding: 8 }}>Engines</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {grouped.slice(0, 40).map((r) => (
+                  {pagedGrouped.map((r) => (
                     <tr key={r.key} style={{ borderTop: "1px solid rgba(148,163,184,0.16)" }}>
-                      <td style={{ padding: 8 }}>{r.country}</td><td style={{ padding: 8 }}>{r.operator}</td><td style={{ padding: 8 }}>{r.continent}</td><td style={{ padding: 8 }}>{Object.keys(r.family).slice(0,2).join(", ") || "Mixed"}</td><td style={{ padding: 8 }}>{Object.keys(r.dash).slice(0,3).join(", ") || "Mixed"}</td><td style={{ padding: 8 }}>{Object.entries(r.status).map(([k,v]) => `${k}: ${opFmt(v)}`).join(" | ")}</td><td style={{ padding: 8 }}>{opFmt(r.engines)}</td>
+                      <td style={{ padding: 8 }}>{r.country}</td><td style={{ padding: 8 }}>{r.operator}</td><td style={{ padding: 8 }}>{r.continent}</td><td style={{ padding: 8 }}>{Object.keys(r.family).slice(0,2).join(", ") || "Mixed"}</td><td style={{ padding: 8 }}>{Object.keys(r.dash).slice(0,3).join(", ") || "Mixed"}</td><td style={{ padding: 8 }}>{Object.entries(r.status).map(([k,v]) => `${k}: ${opFmt(v)}`).join(", ")}</td><td style={{ padding: 8, maxWidth: 140 }}>{Object.keys(r.gem).map((k) => (k === "" ? "blank" : k)).join(", ") || "—"}</td><td style={{ padding: 8, maxWidth: 220, whiteSpace: "normal", wordBreak: "break-word" }}>{[...r.commentHints].slice(0, 3).join(" · ") || "—"}</td><td style={{ padding: 8 }}>{opFmt(r.engines)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </Card>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(360px,1fr))", gap: 16 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(320px,1fr))", gap: 16 }}>
               <Card style={{ minHeight: 340 }}>
                 <OpSectionTitle title="Operator Ranking" subtitle="Top operators by engine count" />
                 <ResponsiveContainer width="100%" height={270}><BarChart data={operatorRanking}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" /><XAxis dataKey="name" hide /><YAxis /><Tooltip /><Bar dataKey="engines" fill="#38bdf8" radius={[6,6,0,0]} /></BarChart></ResponsiveContainer>
@@ -1450,6 +1612,21 @@ function OperatorLeapPanel({ xlsxReady }) {
               <Card style={{ minHeight: 340 }}>
                 <OpSectionTitle title="Status Breakdown" subtitle="Lifecycle mix" />
                 <ResponsiveContainer width="100%" height={270}><PieChart><Pie data={byStatus} dataKey="value" nameKey="status" outerRadius={95} label>{byStatus.map((x) => <Cell key={x.status} fill={OP_STATUS_COLORS[x.status] || OP_STATUS_COLORS.Unknown} />)}</Pie><Tooltip /></PieChart></ResponsiveContainer>
+              </Card>
+              <Card style={{ minHeight: 340 }}>
+                <OpSectionTitle title="GEM Status" subtitle="Values from Gem Status.xlsx (filtered engine rows)" />
+                {byGem.length ? (
+                  <ResponsiveContainer width="100%" height={270}>
+                    <PieChart>
+                      <Pie data={byGem} dataKey="value" nameKey="name" outerRadius={95} label>
+                        {byGem.map((x, i) => <Cell key={x.name} fill={OP_PIE_COLORS[i % OP_PIE_COLORS.length]} />)}
+                      </Pie>
+                      <Tooltip />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ color: "#94a3b8", fontSize: 13, padding: 24 }}>No GEM status data in the current filter.</div>
+                )}
               </Card>
             </div>
 
@@ -1463,31 +1640,8 @@ function OperatorLeapPanel({ xlsxReady }) {
             </div>
           </div>
         ) : (
-          <Card style={{ color: "#94a3b8" }}>Upload a single file in Operator Search to view the dashboard.</Card>
-        )
-      ) : (
-        trendRows.length ? (
-          <div style={{ display: "grid", gap: 16 }}>
-            <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))" }}>
-              <Card style={{ borderColor: "rgba(249,115,22,0.45)" }}><div style={{ color: "#94a3b8" }}>LEAP MoM Growth</div><div style={{ fontSize: 32, color: leapGrowth >= 0 ? "#34d399" : "#f87171", fontWeight: 700 }}>{leapGrowth >= 0 ? "+" : ""}{leapGrowth.toFixed(1)}%</div></Card>
-              <Card><div style={{ color: "#94a3b8" }}>Months</div><div style={{ fontSize: 24, fontWeight: 700 }}>{folderInfo.months.join(", ")}</div></Card>
-              <Card><div style={{ color: "#94a3b8" }}>Files Processed</div><div style={{ fontSize: 32, fontWeight: 700 }}>{folderInfo.count}</div></Card>
-            </div>
-            <div style={{ display: "grid", gap: 16, gridTemplateColumns: "repeat(auto-fit,minmax(360px,1fr))" }}>
-              <Card style={{ minHeight: 330 }}><OpSectionTitle title="Monthly LEAP Trend" subtitle="LEAP by month" /><ResponsiveContainer width="100%" height={250}><AreaChart data={trendByMonth}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" /><XAxis dataKey="month" /><YAxis /><Tooltip /><Area type="monotone" dataKey="LEAP" stroke="#f97316" fill="#f9731633" strokeWidth={3} /></AreaChart></ResponsiveContainer></Card>
-              <Card style={{ minHeight: 330 }}><OpSectionTitle title="CFM vs LEAP Growth" subtitle="Two-line trend" /><ResponsiveContainer width="100%" height={250}><BarChart data={trendByMonth}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" /><XAxis dataKey="month" /><YAxis /><Tooltip /><Legend /><Bar dataKey="CFM" fill="#38bdf8" /><Bar dataKey="LEAP" fill="#f97316" /></BarChart></ResponsiveContainer></Card>
-            </div>
-            <Card style={{ minHeight: 350 }}>
-              <OpSectionTitle title="Region-wise LEAP Growth" subtitle="Continent adoption" />
-              <ResponsiveContainer width="100%" height={270}>
-                <BarChart data={leapRegion}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,0.2)" /><XAxis dataKey="month" /><YAxis /><Tooltip /><Legend />{Object.keys(leapRegion[0] || {}).filter((k) => k !== "month").map((c, i) => <Bar key={c} dataKey={c} fill={OP_PIE_COLORS[i % OP_PIE_COLORS.length]} />)}</BarChart>
-              </ResponsiveContainer>
-            </Card>
-          </div>
-        ) : (
-          <Card style={{ color: "#94a3b8" }}>To analyze LEAP engine trends, select a folder with monthly Excel files.</Card>
-        )
-      )}
+          <Card style={{ color: "#94a3b8" }}>No operator rows parsed from the uploaded file. Use the main “Drop your Excel file” upload with a valid CH Aviation export.</Card>
+        )}
     </div>
   );
 }
